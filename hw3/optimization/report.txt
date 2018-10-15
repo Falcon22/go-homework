@@ -1,0 +1,198 @@
+1) Два цикла делают одно и то же, пробегаясь по списку два раза. Можно заменить на один цикл и одновременно искать оба браузера.
+Однако, сильного прироста это не даёт, тут скорее вопрос здравого смысла.
+
+BenchmarkSlow-4               10         202698659 ns/op        320462175 B/op    284134 allocs/op
+BenchmarkFast-4               10         201745853 ns/op        320461724 B/op    284134 allocs/op
+
+2) Стандартный Unmarshal заменяем на easyjson.
+Для этого мне потребовалось создать структуру и запустить кодогенератор easyjson.
+
+type User struct {
+	Name string `json:"name,string"`
+	Browsers []string `json:"browsers,[]string"`
+	Email string `json:"email,string"`
+}
+
+
+err := json.Unmarshal([]byte(line), &user)
+переписать на
+var user User
+err := user.UnmarshalJSON([]byte(line))
+
+И убрать преобразование интерфейсов
+
+Профайл SlowSearch:
+cpu:
+         .      390ms     38:           err := json.Unmarshal([]byte(line), &user)      // заменим на easyjson
+         .          .     39:           if err != nil {
+         .          .     40:                   panic(err)
+         .          .     41:           }
+
+Профайл FastSearch:
+cpu:
+         .       50ms    192:           err := user.UnmarshalJSON([]byte(line))
+         .          .    193:           if err != nil {
+         .          .    194:                   continue
+         .          .    195:           }
+
+BenchmarkSlow-4                5         212858097 ns/op        320460763 B/op    284126 allocs/op
+BenchmarkFast-4               10         117452186 ns/op        319127365 B/op    233207 allocs/op
+
+
+3) Регулярку лучше прекомпилировать, а ещё лучше использовать strings.Contains
+Профайл SlowSearch:
+alloc_space:
+         .   304.47MB     89:                   if ok, err := regexp.MatchString("MSIE", browser); ok && err == nil {
+         .          .     90:                           isMSIE = true
+         .          .     91:                           notSeenBefore := true
+         .          .     92:                           for _, item := range seenBrowsers {
+         .          .     93:                                   if item == browser {
+         .          .     94:                                           notSeenBefore = false
+         .          .     95:                                   }
+         .          .     96:                           }
+
+alloc_objects:
+    .     208276     89:                   if ok, err := regexp.MatchString("MSIE", browser); ok && err == nil {
+         .          .     90:                           isMSIE = true
+         .          .     91:                           notSeenBefore := true
+         .          .     92:                           for _, item := range seenBrowsers {
+         .          .     93:                                   if item == browser {
+         .          .     94:                                           notSeenBefore = false
+         .          .     95:                                   }
+         .          .     96:                           }
+
+Сначала попробуем прекомпилировать:
+Заменяем
+if ok, err := regexp.MatchString("Android", browser); ok && err == nil {...}
+
+и
+
+if ok, err := regexp.MatchString("Android", browser); ok && err == nil {...}
+
+на
+
+r1 := regexp.MustCompile("Android")
+r2 := regexp.MustCompile("MSIE")
+
+if ok:= r1.MatchString(browser); ok {...}
+if ok:= r2.MatchString(browser); ok {...}
+
+Получаем значительный прирост производительностиЖ
+BenchmarkSlow-4               10         169984526 ns/op        320462692 B/op    284141 allocs/op
+BenchmarkFast-4              100          17017960 ns/op         5612723 B/op      59824 allocs/op
+
+
+А теперь пробуем strings.Contains:
+
+if ok = strings.Contains(browser, "Android"); ok {...}
+if ok = strings.Contains(browser, "MSIE"); ok {...}
+
+BenchmarkSlow-4               10         171955466 ns/op        320461156 B/op    284128 allocs/op
+BenchmarkFast-4              100          16656598 ns/op         5534001 B/op      59768 allocs/op
+
+Немного лучше, остановимся на нём.
+
+4) В контесте данной задачи не имеет смысла хранить всех пользователей в контейнере, лучше обрабатывать каждую структуру в цикле
+т. к. нас интересует только результат обработки входных данных, но не интересует их хранение.
+Удаляем
+users := make([]map[string]interface{}, 0)
+и анализируем user сразу после unmarshal
+
+Видим прирост:
+BenchmarkSlow-a4               10         182112788 ns/op        320462523 B/op    284140 allocs/op
+BenchmarkFast-4               10         125114989 ns/op        320443526 B/op    284106 allocs/op
+
+
+5) Заменим ReadAll с записью всех данных в одну строку и разбиением её сплитом на построчный ввод при помощи bufio.Scanner
+
+alloc_space:
+         .     5.50MB     22:   fileContents, err := ioutil.ReadAll(file)
+         .          .     23:   if err != nil {
+         .          .     24:           panic(err)
+
+    1.64MB     1.67MB     32:   lines := strings.Split(string(fileContents), "\n")
+
+
+fileContents, err := ioutil.ReadAll(file)
+	if err != nil {
+		panic(err)
+	}
+
+и
+
+lines := strings.Split(string(fileContents), "\n")
+for _, line := range lines { ... }
+
+Меняем на
+
+scanner := bufio.NewScanner(file)
+for scanner.Scan() {
+    line := scanner.Bytes()
+    ...
+    }
+
+BenchmarkSlow-4                5         206443532 ns/op        320462985 B/op    284136 allocs/op
+BenchmarkFast-4               10         188639930 ns/op        317186921 B/op    283119 allocs/op
+
+
+6) Мне показалось не логичным использовать слайс строк для подсчёта уникальных значений. Поиск значения в слайсе O(n) что достаточно медленно и неудобно.
+Заменим слайс на структуру, которая как раз и служит для хранения уникальных ключей - map.
+Как значение будем хранить bool и будет считать, что false - не принадлежит множеству. (Мне показалось это удобным т. к. значение по умолчанию при взятии несуществующего ключа будет false).
+
+         8          8     72:                                   seenBrowsers = append(seenBrowsers, browser)
+         .          .     73:                                   uniqueBrowsers++
+
+Меняем
+seenBrowsers := []string{}
+на
+seenBrowsers := make(map[string]bool, 0)
+
+и
+
+notSeenBefore := true
+				for _, item := range seenBrowsers {
+					if item == browser {
+						notSeenBefore = false
+					}
+				}
+				if notSeenBefore {
+					// log.Printf("SLOW New browser: %s, first seen: %s", browser, user["name"])
+					seenBrowsers = append(seenBrowsers, browser)
+					uniqueBrowsers++
+				}
+
+на
+
+seenBrowsers[browser] = true
+
+В итоге при вызове len(seenBrowsers) мы так же получим число уникальных элементов
+
+Есть небольшой прирост производительности, но опять таки это скорее вопрос здравого смысла.
+
+BenchmarkSlow-4               10         181194413 ns/op        320461916 B/op    284136 allocs/op
+BenchmarkFast-4               10         178264860 ns/op        320467871 B/op    284128 allocs/op
+
+   .          .    273:                           seenBrowsers[browser] = true
+
+7) Совместим пункты 4) и 5) и добавим туда sync.Pool чтобы разгрузить garbage collector
+
+Добавим:
+cap := make([]byte, 0, 1024)
+	dataPool.Put(cap)
+	line := dataPool.Get().([]byte)
+	for scanner.Scan() {
+		line = scanner.Bytes()
+        ...
+        }
+BenchmarkSlow-4               10         179716600 ns/op        320462436 B/op    284136 allocs/op
+BenchmarkFast-4               10         119552144 ns/op        317169716 B/op    283092 allocs/op
+
+8) Склеим все оптимизаци:
+
+go test -bench . -benchmem
+BenchmarkSlow-4               10         187293444 ns/op        320462929 B/op    284141 allocs/op
+BenchmarkFast-4              500           3732530 ns/op          750817 B/op       7593 allocs/op
+
+go test -bench . -benchmem -cpuprofile=cpu.out -memprofile=mem.out -memprofilerate=1
+BenchmarkSlow-4                1        1166237493 ns/op        320484472 B/op    284136 allocs/op
+BenchmarkFast-4               50          28734208 ns/op          751604 B/op       7594 allocs/op
